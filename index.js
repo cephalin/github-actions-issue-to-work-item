@@ -206,6 +206,9 @@ async function create(vm) {
 async function assign(vm, workItem) {
 
 	let patchDocument = [];
+	console.log("vm.env.idMappingUrl = " + vm.env.idMappingUrl);
+	console.log("vm.env.idMappingPat = " + vm.env.idMappingPat);
+	console.log("vm.env.idMappingQuery = " + vm.env.idMappingQuery);
 
 	fetch(vm.env.idMappingUrl + vm.assignee, {
 		headers: { 
