@@ -220,6 +220,7 @@ async function assign(vm, workItem) {
     .then(res => res.json())
 	.then(json => {
 
+		console.log(json);
 		var aadUser = jp.value(json, vm.env.idMappingQuery);
 		if (aadUser == undefined) {
 			console.log("User mapping for " + vm.assignee + " not found.");
