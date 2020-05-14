@@ -247,7 +247,8 @@ async function assign(vm, workItem) {
 	})
 	.catch(error => {
 		console.log("Failed to map user ID.");
-		core.setFailed(error);
+		console.log(error);
+		core.setFailed(error.toString());
 	});
 }
 
