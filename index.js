@@ -223,7 +223,7 @@ async function assign(vm, workItem) {
 		var aadUser = jp.value(json, vm.env.idMappingQuery);
 		if (aadUser == undefined) {
 			console.log("User mapping for " + vm.assignee + " not found.");
-			core.setFailed(error.toString());
+			core.setFailed("Assign failed.");
 		}
 		// Make changes only if AB issue is unassigned or assigned to a different user.
 		if( workItem.fields["System.AssignedTo"] == undefined || aadUser != workItem.fields["System.AssignedTo"].uniqueName )
