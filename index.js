@@ -3,6 +3,7 @@ const github = require(`@actions/github`);
 const azdev = require(`azure-devops-node-api`);
 const fetch = require('node-fetch');
 const jp = require('jsonpath');
+var util = require('util');
 
 const debug = false; // debug mode for testing...always set to false before doing a commit
 const testPayload = []; // used for debugging, cut and paste payload
@@ -25,7 +26,7 @@ async function main() {
 			env.ado_wit = "User Story";
 			env.ado_close_state = "Closed";
 			env.ado_new_state = "New";
-			env.id_mapping_url = "{id mapping api that ends with '/'. github username will be appended for the query}";
+			env.id_mapping_url = "{id mapping api that includes an %s where the github user should be inserted}";
 			env.id_mapping_pat = "id mapping api's token";
 			env.id_mapping_query = "jsonpath query to get the unique id from the json response";
 	
@@ -88,6 +89,9 @@ async function main() {
 			case "assigned":
 				workItem != null ? await assign(vm, workItem) : "";
 				break;
+			case "unassigned":
+				workItem != null ? await unassign(vm, workItem) : "";
+				break;
 			case "labeled":
 				workItem != null ? await label(vm, workItem) : "";
 				break;
@@ -110,7 +114,7 @@ async function main() {
 			core.setOutput(`id`, `${workItem.id}`);
 		}
 	} catch (error) {
-		core.setFailed(error);
+		core.setFailed(error.toString());
 	}
 }
 
@@ -202,33 +206,27 @@ async function create(vm) {
 	return workItemSaveResult;
 }
 
-// update existing working item
+// assign a mapped user
 async function assign(vm, workItem) {
-
 	let patchDocument = [];
-	console.log("vm.env.idMappingUrl = " + vm.env.idMappingUrl);
-	console.log("vm.env.idMappingPat = " + vm.env.idMappingPat);
-	console.log("vm.env.idMappingQuery = " + vm.env.idMappingQuery);
 
-	fetch(vm.env.idMappingUrl + vm.assignee, {
-		headers: { 
-			'Content-Type': 'application/json',
-			'api-version': '2019-10-01',
-			'Authorization': 'Basic ' + Buffer.from(':' + vm.env.idMappingPat).toString('base64'),
-		},
-    })
-    .then(res => res.json())
-	.then(json => {
-
-		console.log(json);
+	try {
+		const response = await fetch(util.format(vm.env.idMappingUrl, vm.assignee), {
+			headers: { 
+				'Content-Type': 'application/json',
+				'Authorization': 'Basic ' + Buffer.from(':' + vm.env.idMappingPat).toString('base64'),
+			},
+		});
+	
+		const json = await response.json();
 		var aadUser = jp.value(json, vm.env.idMappingQuery);
 		if (aadUser == undefined) {
-			console.log("User mapping for " + vm.assignee + " not found.");
-			core.setFailed("Assign failed.");
-		}
+			// console.log("JSON data: " + json);
+			core.setFailed("User mapping for " + vm.assignee + " not found.");
+		} 
 		// Make changes only if AB issue is unassigned or assigned to a different user.
-		if( workItem.fields["System.AssignedTo"] == undefined || aadUser != workItem.fields["System.AssignedTo"].uniqueName )
-		{
+		else if ( workItem.fields["System.AssignedTo"] == undefined || aadUser != workItem.fields["System.AssignedTo"].uniqueName ) {
+
 			patchDocument.push({
 				op: "add",
 				path: "/fields/System.AssignedTo",
@@ -245,15 +243,44 @@ async function assign(vm, workItem) {
 					vm.assignee +
 					'</a>.',
 			});
-	
-			return updateWorkItem(patchDocument, workItem.id, vm.env);
 		}
-	})
-	.catch(error => {
+	} catch (error) {
 		console.log("Failed to map user ID.");
 		console.log(error);
 		core.setFailed(error.toString());
-	});
+	}
+
+	if (patchDocument.length > 0) {
+		return await updateWorkItem(patchDocument, workItem.id, vm.env);
+	} else {
+		return null;
+	}
+}
+
+// unassign user
+async function unassign(vm, workItem) {
+	let patchDocument = [];
+
+	if (workItem.fields["System.AssignedTo"] != undefined) {
+		patchDocument.push({
+			op: "add",
+			path: "/fields/System.AssignedTo",
+			value: "",
+		});
+	
+		patchDocument.push({
+			op: "add",
+			path: "/fields/System.History",
+			value:
+				'GitHub issue unassigned',
+		});
+	}
+
+	if (patchDocument.length > 0) {
+		return await updateWorkItem(patchDocument, workItem.id, vm.env);
+	} else {
+		return null;
+	}
 }
 
 // update existing working item
@@ -313,11 +340,13 @@ async function comment(vm, workItem) {
 async function close(vm, workItem) {
 	let patchDocument = [];
 
-	patchDocument.push({
-		op: "add",
-		path: "/fields/System.State",
-		value: vm.env.closedState,
-	});
+	if (!workItem.fields["System.State"] != vm.env.closedState ) {
+		patchDocument.push({
+			op: "add",
+			path: "/fields/System.State",
+			value: vm.env.closedState,
+		});
+	}
 
 	if (vm.comment_text != "") {
 		patchDocument.push({
@@ -356,17 +385,19 @@ async function close(vm, workItem) {
 async function reopen(vm, workItem) {
 	let patchDocument = [];
 
-	patchDocument.push({
-		op: "add",
-		path: "/fields/System.State",
-		value: vm.env.newState,
-	});
-
-	patchDocument.push({
-		op: "add",
-		path: "/fields/System.History",
-		value: "Issue reopened",
-	});
+	if (!workItem.fields["System.State"] == vm.env.closedState ) {
+		patchDocument.push({
+			op: "add",
+			path: "/fields/System.State",
+			value: vm.env.newState,
+		});
+	
+		patchDocument.push({
+			op: "add",
+			path: "/fields/System.History",
+			value: "Issue reopened",
+		});
+	}
 
 	if (patchDocument.length > 0) {
 		return await updateWorkItem(patchDocument, workItem.id, vm.env);
