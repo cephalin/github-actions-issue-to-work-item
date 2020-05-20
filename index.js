@@ -3,7 +3,7 @@ const github = require(`@actions/github`);
 const azdev = require(`azure-devops-node-api`);
 const fetch = require('node-fetch');
 const jp = require('jsonpath');
-var util = require('util');
+const util = require('util');
 
 const debug = false; // debug mode for testing...always set to false before doing a commit
 const testPayload = []; // used for debugging, cut and paste payload
