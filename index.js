@@ -340,7 +340,7 @@ async function comment(vm, workItem) {
 async function close(vm, workItem) {
 	let patchDocument = [];
 
-	if (!workItem.fields["System.State"] != vm.env.closedState ) {
+	if (!workItem.fields["System.State"] == vm.env.closedState ) {
 		patchDocument.push({
 			op: "add",
 			path: "/fields/System.State",
@@ -385,7 +385,7 @@ async function close(vm, workItem) {
 async function reopen(vm, workItem) {
 	let patchDocument = [];
 
-	if (!workItem.fields["System.State"] == vm.env.closedState ) {
+	if (workItem.fields["System.State"] == vm.env.closedState ) {
 		patchDocument.push({
 			op: "add",
 			path: "/fields/System.State",
