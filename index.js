@@ -70,6 +70,7 @@ async function main() {
 
 		// create right patch document depending on the action tied to the issue
 		// update the work item
+		console.log(`Action: ${vm.action}`)
 		switch (vm.action) {
 			case "opened":
 				workItem === null ? await create(vm) : "";
@@ -317,6 +318,7 @@ async function update(vm, workItem) {
 async function comment(vm, workItem) {
 	let patchDocument = [];
 
+	console.log(`CommentText: ${vm.comment_text}`)
 	if (vm.comment_text != "") {
 		patchDocument.push({
 			op: "add",
