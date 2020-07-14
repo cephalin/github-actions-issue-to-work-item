@@ -542,7 +542,7 @@ async function updateIssueBody(vm, workItem) {
 
 	if (!n) {
 		const octokit = new github.GitHub(vm.env.ghToken);
-		vm.body = vm.body + "\r\n\r\nAB#" + workItem.id.toString();
+		vm.body = vm.body + "\r\n\r\nAzure DevOps Bot: AB#" + workItem.id.toString();
 
 		var result = await octokit.issues.update({
 			owner: vm.owner,
