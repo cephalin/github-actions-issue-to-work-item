@@ -126,7 +126,7 @@ async function main() {
 				break;
 			case "assigned":
 				if (vm.assignee != undefined && vm.assignee in idMappings) {
-					patch = assign(patch, workItem, idMappings[vm.assignee]);
+					patch = assign(patch, workItem, lookUpUser(vm.assignee, env));
 				}
 				else {
 					patch = unassign(patch, workItem);
@@ -145,9 +145,7 @@ async function main() {
 							patch = linkWorkItem(vm, patch);
 							patch = updateState(patch, vm.env.openState);
 							patch = commentWorkItem(patch, 'New issue: ' + createIssueLink(vm));
-							if (vm.assignee != undefined && vm.assignee in idMappings) {
-								patch = assign(patch, idMappings[vm.assignee]);
-							}
+							patch = assign(patch, allowedServiceLabels[vm.label]);
 							workItem = await create(patch, env);
 						}
 
@@ -286,7 +284,7 @@ function linkWorkItem(vm, patchDocument) {
 }
 
 // assign a mapped user
-function assign(patchDocument, workItem, aadUser) {	
+function assign(patchDocument, workItem, aadUser) {		
 	if (workItem != null) {
 		if (workItem.fields["System.AssignedTo"] == undefined || aadUser != workItem.fields["System.AssignedTo"].uniqueName) {
 			patchDocument = assign(patchDocument, aadUser);
@@ -296,14 +294,44 @@ function assign(patchDocument, workItem, aadUser) {
 	return patchDocument;	
 }
 
-function assign(patchDocument, aadUser) {	
-	patchDocument.push({
-		op: "add",
-		path: "/fields/System.AssignedTo",
-		value: aadUser,
-	});
+function lookUpUser(alias, env) {
+	var aadUser = undefined;
+	try {
+		const response = await fetch(util.format(env.idMappingUrl, alias), {
+			headers: { 
+				'Content-Type': 'application/json',
+				'Authorization': 'Basic ' + Buffer.from(':' + env.idMappingPat).toString('base64'),
+			},
+		});
+	
+		const json = await response.json();
+		aadUser = jp.value(json, env.idMappingQuery);
+		if (aadUser == undefined) {
+			// console.log("JSON data: " + json);
+			core.setFailed("User mapping for " + alias + " not found.");
+		} 
+		
+		
+	} 
+	catch (error) {
+		console.log("Failed to map user ID.");
+		console.log(error);
+		core.setFailed(error.toString());
+	}	
 
-	patchDocument = commentWorkItem(patchDocument, createCommentLink('https://github.com/' + vm.assignee, vm.assignee));	
+	return aadUser;
+}
+
+function assign(patchDocument, aadUser) {	
+	if (aadUser != "" && aadUser != undefined) {
+		patchDocument.push({
+			op: "add",
+			path: "/fields/System.AssignedTo",
+			value: aadUser,
+		});
+
+		patchDocument = commentWorkItem(patchDocument, createCommentLink('https://github.com/' + vm.assignee, vm.assignee));	
+	}
 
 	return patchDocument;	
 }
