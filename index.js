@@ -4,10 +4,10 @@ const azdev = require(`azure-devops-node-api`);
 const fetch = require('node-fetch');
 const jp = require('jsonpath');
 const util = require('util');
+const { link } = require('fs');
 
 const debug = false; // debug mode for testing...always set to false before doing a commit
 const testPayload = []; // used for debugging, cut and paste payload
-
 main();
 
 async function main() {
@@ -37,6 +37,47 @@ async function main() {
 			vm = getValuesFromPayload(github.context.payload, env);
 		}
 
+		// Determine if solution is turned on.
+		var stateWorkItem = await findWorkItem("[GitHub AzureDevOps Sync State]", ['GitHubIssue', vm.repository.name]);
+		if (stateWorkItem === null) {
+			var patch = createPatchDocument("[GitHub AzureDevOps Sync State]", "This task controls the state of AzureDevOps to GitHub synchronization", ["GitHub Issue", vm.repo_name], vm.env.areaPath);
+			patch = close(patchDocument);
+			stateWorkItem = await create(patch, vm.env);
+		}
+
+		if (stateWorkItem === -1) {
+			core.setFailed();
+			return;
+		}
+
+		var allowedServiceLabels = {};
+		var idMappings = {};
+		if (stateWorkItem.fields["System.State"] == vm.env.closedState) {
+			return;
+		}
+		else {
+			let comments = await getWorkItemComments(stateWorkItem);
+			for (comment of comments) {
+				try {
+					var json = JSON.parse(comment.text);
+					if (json != null) {
+						if (json.gitHubAlias != undefined && json.labels != undefined && Array.isArray(json.labels)) {
+							for (label in json.labels) {
+								if (!(label in allowedServiceLabels)) {
+									allowedServiceLabels[label] = comment.createdBy.uniqueName;
+								}
+
+								idMappings[json.gitHubAlias] = comment.createdBy.uniqueName;
+							}							
+						}						
+					}
+				}	
+				catch (err) {
+					console.log(err.message);
+				}
+			}
+		}
+		
 		// todo: validate we have all the right inputs
 
 		// go check to see if work item already exists in azure devops or not
@@ -49,55 +90,83 @@ async function main() {
 		if (workItem === -1) {
 			core.setFailed();
 			return;
-		}
-
-		// if a work item was not found, go create one
-		if (workItem === null) {
-			console.log("No work item found, creating work item from issue");
-			workItem = await create(vm);
-
-			// if workItem == -1 then we have an error during create
-			if (workItem === -1) {
-				core.setFailed();
-				return;
-			}
-
-			// link the issue to the work item via AB# syntax with AzureBoards+GitHub App
-			issue = vm.env.ghToken != "" ? await updateIssueBody(vm, workItem) : "";
-		} else {
-			console.log(`Existing work item found: ${workItem.id}`);
-		}
+		}		
 
 		// create right patch document depending on the action tied to the issue
 		// update the work item
 		console.log(`Action: ${vm.action}`)
+		let patch = [];
 		switch (vm.action) {
 			case "opened":
-				workItem === null ? await create(vm) : "";
+				patch = update(vm, workItem);
+				patch = updateState(patch, workItem, vm.env.openState);
+				if (patch.length > 0) {
+					patch = commentWorkItem(patch, createIssueLink(vm) + ' opened.');
+				}								
 				break;
 			case "edited":
-				workItem != null ? await update(vm, workItem) : "";
+				patch = update(vm, workItem);					
 				break;
 			case "created": // adding a comment to an issue
-				workItem != null ? await comment(vm, workItem) : "";
+				patch = commentWorkItem(patch, vm.comment_text);
 				break;
 			case "closed":
-				workItem != null ? await close(vm, workItem) : "";
+				patch = updateState(patch, workItem, vm.env.closedState);
+				if (patch.length > 0) {
+					patch = commentWorkItem(patch, createIssueLink(vm) + ' closed.');
+					patch = commentWorkItem(patch, vm.comment_text);
+				}
 				break;
 			case "reopened":
-				workItem != null ? await reopen(vm, workItem) : "";
+				patch = update(vm, workItem);
+				patch = updateState(patch, workItem, vm.env.openState);
+				if (patch.length > 0) {
+					patch = commentWorkItem(patch, createIssueLink(vm) + 'reopened.');
+				}
 				break;
 			case "assigned":
-				workItem != null ? await assign(vm, workItem) : "";
+				if (vm.assignee != undefined && vm.assignee in idMappings) {
+					patch = assign(patch, workItem, idMappings[vm.assignee]);
+				}
+				else {
+					patch = unassign(patch, workItem);
+				}
 				break;
 			case "unassigned":
-				workItem != null ? await unassign(vm, workItem) : "";
+				patch = unassign(patch, workItem);
 				break;
 			case "labeled":
-				workItem != null ? await label(vm, workItem) : "";
+				// if a work item was not found, go create one
+				if (workItem === null) {
+					if (vm.label in allowedServiceLabels) {						
+						console.log("No work item found, creating work item from issue");
+						if (vm.state == "open") {
+							var patch = createIssuePatchDocument(vm);
+							patch = linkWorkItem(vm, patch);
+							patch = updateState(patch, vm.env.openState);
+							patch = commentWorkItem(patch, 'New issue: ' + createIssueLink(vm));
+							if (vm.assignee != undefined && vm.assignee in idMappings) {
+								patch = assign(patch, idMappings[vm.assignee]);
+							}
+							workItem = await create(patch, env);
+						}
+
+						// if workItem == -1 then we have an error during create
+						if (workItem === -1) {
+							core.setFailed();
+							return;
+						}
+						
+						// link the issue to the work item via AB# syntax with AzureBoards+GitHub App
+						issue = vm.env.ghToken != "" ? await updateIssueBody(vm, workItem) : "";
+					}
+				} else {
+					console.log(`Existing work item found: ${workItem.id}`);
+					patch = addLabel(patch, vm, workItem);
+				}				
 				break;
 			case "unlabeled":
-				workItem != null ? await unlabel(vm, workItem) : "";
+				patch = unlabel(patch, vm, workItem);
 				break;
 			case "deleted":
 				console.log("deleted action is not yet implemented");
@@ -109,6 +178,8 @@ async function main() {
 				console.log(`Unhandled action: ${vm.action}`);
 		}
 
+		let result = await updateWorkItem(patch, workItem, env);	
+
 		// set output message
 		if (workItem != null || workItem != undefined) {
 			console.log(`Work item successfully created or updated: ${workItem.id}`);
@@ -119,59 +190,50 @@ async function main() {
 	}
 }
 
-// create Work Item via https://docs.microsoft.com/en-us/rest/api/azure/devops/
-async function create(vm) {
+function createPatchDocument(title, description, tags, areaPath) {
+	var tags = "";
+	for (tag of tags) {
+		tags = tags + tag + "; ";
+	}
+	
 	let patchDocument = [
 		{
 			op: "add",
 			path: "/fields/System.Title",
-			value: vm.title + " (GitHub Issue #" + vm.number + ")",
+			value: title,
 		},
 		{
 			op: "add",
 			path: "/fields/System.Description",
-			value: vm.body,
+			value: description,
 		},
 		{
 			op: "add",
 			path: "/fields/System.Tags",
-			value: "GitHub Issue; " + vm.repo_name,
-		},
-		{
-			op: "add",
-			path: "/fields/System.History",
-			value:
-				'GitHub <a href="' +
-				vm.url +
-				'" target="_new">issue #' +
-				vm.number +
-				'</a> created in <a href="' +
-				vm.repo_url +
-				'" target="_new">' +
-				vm.repo_fullname +
-				"</a>",
-		},
-		{
-			op: "add",
-			path: "/relations/-",
-			value: {
-				rel: "Hyperlink",
-				url: vm.url,
-			},
-		},
-	];
+			value: tags,
+		},				
+	];	
 
 	// if area path is not empty, set it
-	if (vm.env.areaPath != "") {
+	if (areaPath != "") {
 		patchDocument.push({
 			op: "add",
 			path: "/fields/System.AreaPath",
-			value: vm.env.areaPath,
+			value: areaPath,
 		});
 	}
 
-	let authHandler = azdev.getPersonalAccessTokenHandler(vm.env.adoToken);
-	let connection = new azdev.WebApi(vm.env.orgUrl, authHandler);
+	return patchDocument;
+}
+
+function createIssuePatchDocument(vm) {	
+	return createPatchDocument(vm.title + " (GitHub Issue #" + vm.number + ")", vm.body, ['GitHub Issue', vm.repository.name], vm.env.areaPath);
+}
+
+// create Work Item via https://docs.microsoft.com/en-us/rest/api/azure/devops/
+async function create(patchDocument, env) {	
+	let authHandler = azdev.getPersonalAccessTokenHandler(env.adoToken);
+	let connection = new azdev.WebApi(env.orgUrl, authHandler);
 	let client = await connection.getWorkItemTrackingApi();
 	let workItemSaveResult = null;
 
@@ -179,10 +241,10 @@ async function create(vm) {
 		workItemSaveResult = await client.createWorkItem(
 			(customHeaders = []),
 			(document = patchDocument),
-			(project = vm.env.project),
-			(type = vm.env.wit),
+			(project = env.project),
+			(type = env.wit),
 			(validateOnly = false),
-			(bypassRules = vm.env.bypassRules)
+			(bypassRules = env.bypassRules)
 		);
 
 		// if result is null, save did not complete correctly
@@ -190,7 +252,7 @@ async function create(vm) {
 			workItemSaveResult = -1;
 
 			console.log("Error: creatWorkItem failed");
-			console.log(`WIT may not be correct: ${vm.env.wit}`);
+			console.log(`WIT may not be correct: ${env.wit}`);
 			core.setFailed();
 		}
 
@@ -207,249 +269,183 @@ async function create(vm) {
 	return workItemSaveResult;
 }
 
-// assign a mapped user
-async function assign(vm, workItem) {
-	let patchDocument = [];
+function linkWorkItem(vm, patchDocument) {
+	var comment = createIssueLink(vm) + ' created in ' + createRepoLink(vm);
+	patchDocument = commentWorkItem(patchDocument, comment);
 
-	try {
-		const response = await fetch(util.format(vm.env.idMappingUrl, vm.assignee), {
-			headers: { 
-				'Content-Type': 'application/json',
-				'Authorization': 'Basic ' + Buffer.from(':' + vm.env.idMappingPat).toString('base64'),
+	patchDocument.push({
+		op: "add",
+			path: "/relations/-",
+			value: {
+				rel: "Hyperlink",
+				url: vm.url,
 			},
-		});
+	});
 	
-		const json = await response.json();
-		var aadUser = jp.value(json, vm.env.idMappingQuery);
-		if (aadUser == undefined) {
-			// console.log("JSON data: " + json);
-			core.setFailed("User mapping for " + vm.assignee + " not found.");
-		} 
-		// Make changes only if AB issue is unassigned or assigned to a different user.
-		else if ( workItem.fields["System.AssignedTo"] == undefined || aadUser != workItem.fields["System.AssignedTo"].uniqueName ) {
+	return patchDocument;
+}
 
-			patchDocument.push({
-				op: "add",
-				path: "/fields/System.AssignedTo",
-				value: aadUser,
-			});
-	
-			patchDocument.push({
-				op: "add",
-				path: "/fields/System.History",
-				value:
-					'Assigned to GitHub user <a href="https://github.com/' +
-					+ vm.assignee +
-					'" target="_new">' +
-					vm.assignee +
-					'</a>.',
-			});
+// assign a mapped user
+function assign(patchDocument, workItem, aadUser) {	
+	if (workItem != null) {
+		if (workItem.fields["System.AssignedTo"] == undefined || aadUser != workItem.fields["System.AssignedTo"].uniqueName) {
+			patchDocument = assign(patchDocument, aadUser);
 		}
-	} catch (error) {
-		console.log("Failed to map user ID.");
-		console.log(error);
-		core.setFailed(error.toString());
-	}
+	}	
 
-	if (patchDocument.length > 0) {
-		return await updateWorkItem(patchDocument, workItem.id, vm.env);
-	} else {
-		return null;
-	}
+	return patchDocument;	
+}
+
+function assign(patchDocument, aadUser) {	
+	patchDocument.push({
+		op: "add",
+		path: "/fields/System.AssignedTo",
+		value: aadUser,
+	});
+
+	patchDocument = commentWorkItem(patchDocument, createCommentLink('https://github.com/' + vm.assignee, vm.assignee));	
+
+	return patchDocument;	
 }
 
 // unassign user
-async function unassign(vm, workItem) {
-	let patchDocument = [];
+function unassign(patchDocument, workItem) {
+	if (workItem != null) {
+		if (workItem.fields["System.AssignedTo"] != undefined) {
+			patchDocument = unassign(patchDocument);		
+		}	
+	}
 
-	if (workItem.fields["System.AssignedTo"] != undefined) {
-		patchDocument.push({
-			op: "add",
-			path: "/fields/System.AssignedTo",
-			value: "",
-		});
+	return patchDocument;
+}
+
+function unassign(patchDocument) {
+	patchDocument.push({
+		op: "add",
+		path: "/fields/System.AssignedTo",
+		value: "",
+	});
 	
-		patchDocument.push({
-			op: "add",
-			path: "/fields/System.History",
-			value:
-				'GitHub issue unassigned',
-		});
-	}
-
-	if (patchDocument.length > 0) {
-		return await updateWorkItem(patchDocument, workItem.id, vm.env);
-	} else {
-		return null;
-	}
+	patchDocument = commentWorkItem(patchDocument, 'GitHub issue unassigned');
+	
+	return patchDocument;
 }
 
 // update existing working item
-async function update(vm, workItem) {
-	let patchDocument = [];
+function update(patchDocument, vm, workItem) {
+	if (workItem != null) {
+		if (workItem.fields["System.Title"] != `${vm.title} (GitHub Issue #${vm.number})`) {
+			patchDocument.push({
+				op: "add",
+				path: "/fields/System.Title",
+				value: vm.title + " (GitHub Issue #" + vm.number + ")",
+			});
+		}
 
-	if (
-		workItem.fields["System.Title"] !=
-		`${vm.title} (GitHub Issue #${vm.number})`
-	) {
-		patchDocument.push({
-			op: "add",
-			path: "/fields/System.Title",
-			value: vm.title + " (GitHub Issue #" + vm.number + ")",
-		});
+		if (workItem.fields["System.Description"] != vm.body) {
+			patchDocument.push({
+				op: "add",
+				path: "/fields/System.Description",
+				value: vm.body,
+			});
+		}		
 	}
 
-	if (workItem.fields["System.Description"] != vm.body) {
-		patchDocument.push({
-			op: "add",
-			path: "/fields/System.Description",
-			value: vm.body,
-		});
-	}
+	return patchDocument;
+}
 
-	if (patchDocument.length > 0) {
-		return await updateWorkItem(patchDocument, workItem.id, vm.env);
-	} else {
-		return null;
-	}
+function createCommentLink(url, label) {
+	var comment =  '<a href="' + url + '" target="_new">' + label + '</a>';	
+	return comment;
+}
+
+function createIssueLink(vm) {
+	return createCommentLink(vm.url, 'issue #' + vm.number)	
+}
+
+function createRepoLink(vm) {
+	return createCommentLink(vm.repo_url, vm.repo_fullname);
 }
 
 // add comment to an existing work item
-async function comment(vm, workItem) {
-	let patchDocument = [];
-
-	console.log(`CommentText: ${vm.comment_text}`)
-	if (vm.comment_text != "") {
+function commentWorkItem(patchDocument, comment) {
+	console.log(`CommentText: ${comment}`)
+	if (comment != "") {
+		for (patch of patchDocument) {
+			if (patch.path == "/fields/System.History") {
+				updatedComment = true;
+				patch.value = patch.value + '</br></br>' + comment;
+				return patchDocument;
+			}
+		}
+		
 		patchDocument.push({
 			op: "add",
 			path: "/fields/System.History",
 			value:
-				'<a href="' +
-				vm.comment_url +
-				'" target="_new">GitHub Comment Added</a></br></br>' +
-				vm.comment_text,
+				comment,
 		});
 	}
 
-	if (patchDocument.length > 0) {
-		return await updateWorkItem(patchDocument, workItem.id, vm.env);
-	} else {
-		return null;
+	return patchDocument;
+}
+
+function updateState(patchDocument, workItem, state) {
+	if (workItem != null) {
+		if (workItem.fields["System.State"] != state) {
+			patchDocument = updateState(patchDocument, state);		
+		}
 	}
 }
 
-// close work item
-async function close(vm, workItem) {
-	let patchDocument = [];
-
-	if (!workItem.fields["System.State"] == vm.env.closedState ) {
-		patchDocument.push({
-			op: "add",
-			path: "/fields/System.State",
-			value: vm.env.closedState,
-		});
-	}
-
-	if (vm.comment_text != "") {
-		patchDocument.push({
-			op: "add",
-			path: "/fields/System.History",
-			value:
-				'<a href="' +
-				vm.comment_url +
-				'" target="_new">GitHub Comment Added</a></br></br>' +
-				vm.comment_text,
-		});
-	}
-
-	if (vm.closed_at != "") {
-		patchDocument.push({
-			op: "add",
-			path: "/fields/System.History",
-			value:
-				'GitHub <a href="' +
-				vm.url +
-				'" target="_new">issue #' +
-				vm.number +
-				"</a> was closed on " +
-				vm.closed_at,
-		});
-	}
-
-	if (patchDocument.length > 0) {
-		return await updateWorkItem(patchDocument, workItem.id, vm.env);
-	} else {
-		return null;
-	}
-}
-
-// reopen existing work item
-async function reopen(vm, workItem) {
-	let patchDocument = [];
-
-	if (workItem.fields["System.State"] == vm.env.closedState ) {
-		patchDocument.push({
-			op: "add",
-			path: "/fields/System.State",
-			value: vm.env.newState,
-		});
-	
-		patchDocument.push({
-			op: "add",
-			path: "/fields/System.History",
-			value: "Issue reopened",
-		});
-	}
-
-	if (patchDocument.length > 0) {
-		return await updateWorkItem(patchDocument, workItem.id, vm.env);
-	} else {
-		return null;
-	}
+function updateState(patchDocument, state) {
+	patchDocument.push({
+		op: "add",
+		path: "/fields/System.State",
+		value: state,
+	});
 }
 
 // add new label to existing work item
-async function label(vm, workItem) {
-	let patchDocument = [];
-
-	if (!workItem.fields["System.Tags"].includes(vm.label)) {
-		patchDocument.push({
-			op: "add",
-			path: "/fields/System.Tags",
-			value: workItem.fields["System.Tags"] + ", " + vm.label,
-		});
+function addLabel(patchDocument, vm, workItem) {
+	if (workItem != null) {
+		if (!workItem.fields["System.Tags"].includes(vm.label)) {
+			patchDocument.push({
+				op: "add",
+				path: "/fields/System.Tags",
+				value: workItem.fields["System.Tags"] + "; " + vm.label,
+			});
+		}
 	}
 
-	if (patchDocument.length > 0) {
-		return await updateWorkItem(patchDocument, workItem.id, vm.env);
-	} else {
-		return null;
-	}
+	return patchDocument;
 }
 
-async function unlabel(vm, workItem) {
-	let patchDocument = [];
+function unlabel(patchDocument, vm, workItem) {
+	if (workItem != null) {
+		if (workItem.fields["System.Tags"].includes(vm.label)) {
+			var str = workItem.fields["System.Tags"];
+			var res = str.replace(vm.label + "; ", "");
 
-	if (workItem.fields["System.Tags"].includes(vm.label)) {
-		var str = workItem.fields["System.Tags"];
-		var res = str.replace(vm.label + "; ", "");
-
-		patchDocument.push({
-			op: "add",
-			path: "/fields/System.Tags",
-			value: res,
-		});
+			patchDocument.push({
+				op: "add",
+				path: "/fields/System.Tags",
+				value: res,
+			});
+		}
 	}
 
-	if (patchDocument.length > 0) {
-		return await updateWorkItem(patchDocument, workItem.id, vm.env);
-	} else {
-		return null;
-	}
+	return patchDocument;
+}
+
+async function find(vm) {
+	let title = "(GitHub Issue #" + vm.number + ")";
+	let tags = ['GitHub Issue', vm.repository.name ];
+	await findWorkItem(title, tags)
 }
 
 // find work item to see if it already exists
-async function find(vm) {
+async function findWorkItem(title, tags) {
 	let authHandler = azdev.getPersonalAccessTokenHandler(vm.env.adoToken);
 	let connection = new azdev.WebApi(vm.env.orgUrl, authHandler);
 	let client = null;
@@ -467,14 +463,19 @@ async function find(vm) {
 	}
 
 	let teamContext = { project: vm.env.project };
+	var tagString = "";
+	if (Array.isArray(tags)) {
+		for (tag of tags) {
+			tagString = tagString + " AND ";
+			tagString = tagString + "[System.Tags] CONTAINS '" + tag + "'";
+		}
+	}
 
 	let wiql = {
 		query:
-			"SELECT [System.Id], [System.WorkItemType], [System.Description], [System.Title], [System.AssignedTo], [System.State], [System.Tags] FROM workitems WHERE [System.TeamProject] = @project AND [System.Title] CONTAINS '(GitHub Issue #" +
-			vm.number +
-			")' AND [System.Tags] CONTAINS 'GitHub Issue' AND [System.Tags] CONTAINS '" +
-			vm.repository +
-			"'",
+			"SELECT [System.Id], [System.WorkItemType], [System.Description], [System.Title], [System.AssignedTo], [System.State], [System.Tags] FROM workitems WHERE [System.TeamProject] = @project AND [System.Title] CONTAINS '" +
+			title + "'" +
+			tagString,
 	};
 
 	try {
@@ -510,48 +511,60 @@ async function find(vm) {
 }
 
 // standard updateWorkItem call used for all updates
-async function updateWorkItem(patchDocument, id, env) {
-	let authHandler = azdev.getPersonalAccessTokenHandler(env.adoToken);
-	let connection = new azdev.WebApi(env.orgUrl, authHandler);
-	let client = await connection.getWorkItemTrackingApi();
-	let workItemSaveResult = null;
+async function updateWorkItem(patchDocument, workItem, env) {
+	if (workItem != null) {
+		if (workItem === -1) {
+			core.setFailed();
+			return null;
+		}
+		else if (patchDocument.length > 0) {
+			let authHandler = azdev.getPersonalAccessTokenHandler(env.adoToken);
+			let connection = new azdev.WebApi(env.orgUrl, authHandler);
+			let client = await connection.getWorkItemTrackingApi();
+			let workItemSaveResult = null;
 
-	try {
-		workItemSaveResult = await client.updateWorkItem(
-			(customHeaders = []),
-			(document = patchDocument),
-			(id = id),
-			(project = env.project),
-			(validateOnly = false),
-			(bypassRules = env.bypassRules)
-		);
+			try {
+				workItemSaveResult = await client.updateWorkItem(
+					(customHeaders = []),
+					(document = patchDocument),
+					(id = id),
+					(project = env.project),
+					(validateOnly = false),
+					(bypassRules = env.bypassRules)
+				);
 
-		return workItemSaveResult;
-	} catch (error) {
-		console.log("Error: updateWorkItem failed");
-		console.log(error);
-		console.log(patchDocument);
-		core.setFailed(error.toString());
-	}
+				return workItemSaveResult;
+			} catch (error) {
+				console.log("Error: updateWorkItem failed");
+				console.log(error);
+				console.log(patchDocument);
+				core.setFailed(error.toString());			
+			}
+		}
+	}	
+
+	return null;
 }
 
 // update the GH issue body to include the AB# so that we link the Work Item to the Issue
 // this should only get called when the issue is created
 async function updateIssueBody(vm, workItem) {
-	var n = vm.body.includes("AB#" + workItem.id.toString());
+	if (workItem != null) {
+		var n = vm.body.includes("AB#" + workItem.id.toString());
 
-	if (!n) {
-		const octokit = new github.GitHub(vm.env.ghToken);
-		vm.body = vm.body + "\r\n\r\nAzure DevOps Bot: AB#" + workItem.id.toString();
+		if (!n) {
+			const octokit = new github.GitHub(vm.env.ghToken);
+			vm.body = vm.body + "\r\n\r\nAzure DevOps Bot: AB#" + workItem.id.toString();
 
-		var result = await octokit.issues.update({
-			owner: vm.owner,
-			repo: vm.repository,
-			issue_number: vm.number,
-			body: vm.body,
-		});
+			var result = await octokit.issues.update({
+				owner: vm.owner,
+				repo: vm.repository,
+				issue_number: vm.number,
+				body: vm.body,
+			});
 
-		return result;
+			return result;
+		}
 	}
 
 	return null;
@@ -606,6 +619,10 @@ function getValuesFromPayload(payload, env) {
 	if (payload.comment != undefined) {
 		vm.comment_text = payload.comment.body != undefined ? payload.comment.body : "";
 		vm.comment_url = payload.comment.html_url != undefined ? payload.comment.html_url : "";
+	}
+
+	if (payload.issue.assignee != undefined && vm.assignee === undefined) {
+		vm.assignee = payload.assignee.login;
 	}
 
 	// split repo full name to get the org and repository names
